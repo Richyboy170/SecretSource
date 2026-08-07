@@ -1,0 +1,23 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tool outputs — downloaded PDFs and their manifests are run artifacts, not source.
+# Both source-tool and source-semantic-tool write here.
+tools/*/output_pdf/
+
+# Scratch inputs for --from-file batch runs
+tools/*/topics.txt
+tools/*/descriptions.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Note: the sentence-transformers embedding cache lives in ~/.cache/huggingface,
+# outside the repo, so it needs no rule here.

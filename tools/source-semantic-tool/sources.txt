@@ -1,0 +1,49 @@
+# Sites you allow PDFs to be downloaded from.
+# One per line. Full URLs, bare domains, or www-prefixed — all normalized to a host.
+# Subdomains are included automatically: "arxiv.org" also allows "export.arxiv.org".
+# Blank lines and # comments are ignored.
+#
+# Anything resolved from a host NOT listed here is reported as "blocked" and
+# never written to disk.
+#
+# This is this tool's own copy — semantic-tool is self-contained and does not read
+# ../source-tool/sources.txt. Edits here do not affect that tool, and vice versa.
+
+# --- preprint servers ---
+https://arxiv.org/
+https://www.biorxiv.org/
+https://www.medrxiv.org/
+https://openreview.net/
+
+# --- biomedical ---
+https://pubmed.ncbi.nlm.nih.gov/
+https://www.ncbi.nlm.nih.gov/
+https://ftp.ncbi.nlm.nih.gov/
+https://europepmc.org/
+
+# --- publishers ---
+https://www.nature.com/
+https://www.science.org/
+https://www.sciencedirect.com/
+https://link.springer.com/
+https://onlinelibrary.wiley.com/
+https://academic.oup.com/
+https://www.cambridge.org/
+https://journals.plos.org/
+https://www.frontiersin.org/
+https://www.mdpi.com/
+https://www.pnas.org/
+https://elifesciences.org/
+
+# --- computer science ---
+https://dl.acm.org/
+https://ieeexplore.ieee.org/
+https://aclanthology.org/
+https://www.aclweb.org/          # ACL Anthology's older host — indexes still return these
+https://www.jmlr.org/
+https://proceedings.mlr.press/
+
+# --- repositories ---
+https://zenodo.org/
+https://core.ac.uk/
+https://hal.science/
