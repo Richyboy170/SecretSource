@@ -1,0 +1,21 @@
+# Retrieval node: ColPali-family page embeddings into Qdrant.
+#
+#   py -3.14 -m venv .venv
+#   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# INSTALL THIS IN THE VENV, NOT GLOBALLY. colpali-engine pins torch<2.12, so a
+# global install downgrades torch 2.13.0 -> 2.11.0 -- and that is the torch
+# ../source-semantic-tool/requirements.txt documents itself as verified against.
+# The two tools keep separate environments so neither can break the other.
+#
+# Resolved on Python 3.14 / win_amd64 (2026-08-08): colpali_engine 0.3.17,
+# qdrant-client 1.19.0, pymupdf 1.28.2 (abi3), pillow 12.3.0, torch 2.11.0+cpu.
+#
+# Qdrant itself is NOT a Python dependency -- it runs as a server (Docker) and is
+# reached over HTTP. See README.md. The embedded `--qdrant-path` mode needs no
+# server at all and is what the tests use.
+
+colpali-engine>=0.3.17
+qdrant-client>=1.19
+pymupdf>=1.26
+pillow>=11

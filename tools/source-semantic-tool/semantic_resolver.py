@@ -30,6 +30,7 @@ can judge relevance instead of trusting the rank.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -47,20 +48,45 @@ from query_expander import expand as expand_queries
 CONTACT_EMAIL = "richyboy170@gmail.com"  # Crossref/OpenAlex polite pool
 USER_AGENT = f"citation-verifier-semantic/1.0 (mailto:{CONTACT_EMAIL})"
 
-# Calibrated 2026-08-07 against DEFAULT_MODEL — see the README's "Calibrating the
-# floor". Measured: correct answers land 0.47-0.83, pool medians 0.24-0.29.
-# 0.35 sits above the tail and below the weakest correct answer observed.
+# Calibrated 2026-08-08 against DEFAULT_MODEL (specter) over a frozen 363-paper
+# pool — see the README's "Calibrating the floor". Measured: top-5 correct answers
+# land 0.84-0.91, the deliberately nonsensical query tops out at 0.777, pool
+# medians 0.62-0.81. 0.70 drops that nonsense query from 50 results to 6.
 #
-# This is a TAIL FILTER, not an identity guard. Measurement showed no absolute
-# threshold separates a correct answer to a loosely-worded query (0.468) from the
-# top hit of a deliberately nonsensical one (0.529) — cosine is not comparable
-# across queries. It removes obvious noise; it cannot certify a top result.
-# Changing --model invalidates this number.
-MIN_SIMILARITY = 0.35
+# The number moved from 0.35 because specter compresses scores into a narrow high
+# band (pool minima 0.45-0.67, versus MiniLM's -0.03). Carrying 0.35 across the
+# model swap would not have errored — it would have filtered NOTHING, on every
+# query measured. A floor is only meaningful in its own model's distribution.
+#
+# 0.70 rather than the 0.75 the distribution alone suggests, because this constant
+# and TITLE_ONLY_PENALTY multiply: an abstract-less paper needs raw >= floor/0.85
+# to survive, so 0.75 sets that bar at 0.882 — above the entire pool ceiling on
+# both low-scoring queries measured (0.848 and 0.829), i.e. not a demotion but a
+# categorical exclusion, on exactly the vague queries where recall matters most.
+# At 0.70 the bar is 0.824 and abstract-less papers stayed reachable on all five.
+# Change either constant and re-check the product, not just the distribution.
+#
+# This is still a TAIL FILTER, not an identity guard: a nonsense query's best hit
+# (0.777) sits close under a loose query's correct answer (0.848), so cosine
+# remains non-comparable across queries. It removes obvious noise; it cannot
+# certify a top result. Changing --model invalidates this number.
+MIN_SIMILARITY = 0.70
 
 # A candidate with no abstract is scored on its title alone. Dropping those would
 # silently lose real papers (arXiv and Crossref hits often arrive bare), but an
 # unpenalized bare title can outrank a genuine abstract match on short queries.
+#
+# Under specter that risk is acute rather than theoretical: a bare title and a
+# short description are both short, so raw cosine ranked title-only papers 10, 8
+# and 9 of the top 10 on the three real queries measured. The penalty is what
+# clears them out — and because specter's spread is ~0.3-0.44 wide, the same 0.85
+# multiplier that merely nudged under MiniLM (median drop 5-22 ranks) demotes by
+# 22-51 here. That is why specter's top-5 is led by real abstract matches.
+#
+# It also means this constant is coupled to MIN_SIMILARITY: an abstract-less paper
+# only survives if raw >= MIN_SIMILARITY / this. Raise this toward 1.0 if you
+# would rather see bare titles than miss them; `title_only` in the manifest is
+# the counter.
 TITLE_ONLY_PENALTY = 0.85
 
 DEFAULT_TOP_K = 5
@@ -278,6 +304,7 @@ class SemanticResolver:
         ollama_model: str | None = None,
         ollama_url: str | None = None,
         variants: int = 4,
+        pool_dump: str | None = None,
     ):
         self.email = email
         self.max_retries = max_retries
@@ -294,6 +321,13 @@ class SemanticResolver:
         # the resolver stays agnostic about how the runner decides.
         self.url_filter = url_filter
         self.variants = variants
+        # Where to append the deduped pool before ranking, for bench_ranking.py.
+        # Retrieval is the noisy part of this pipeline — the manifest from the
+        # last batch run shows OpenAlex and Semantic Scholar 429ing on every
+        # query — so re-running resolve() once per model would compare rankings
+        # over different pools and read source flakiness as model quality.
+        # Freezing the pool once is what makes a model comparison mean anything.
+        self.pool_dump = pool_dump
         self.embedder = Embedder(model)
         self._expander_kwargs = {
             k: v for k, v in (("model", ollama_model), ("url", ollama_url)) if v
@@ -578,6 +612,35 @@ class SemanticResolver:
             paper.matched_queries.sort()
         return list(papers.values())
 
+    def _dump_pool(self, description: str, queries: list[str],
+                   papers: list[Paper]) -> None:
+        """Append the deduped, unscored pool as one JSONL record.
+
+        Written BEFORE _rank so the snapshot carries no similarity — the whole
+        point is that scores are what the bench recomputes. Appends rather than
+        overwrites so a batch run over topics.txt leaves one file holding every
+        topic's pool.
+        """
+        record = {
+            "description": description,
+            "expanded_queries": queries,
+            "papers": [
+                {
+                    "key": p.key,
+                    "title": p.title,
+                    "abstract": p.abstract,
+                    "doi": p.doi,
+                    "pdf_urls": p.pdf_urls,
+                    "landing_url": p.landing_url,
+                    "retrieval_sources": p.retrieval_sources,
+                    "matched_queries": p.matched_queries,
+                }
+                for p in papers
+            ],
+        }
+        with open(self.pool_dump, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     def _rank(self, description: str, papers: list[Paper]) -> list[Paper]:
         """Score every paper against the ORIGINAL description.
 
@@ -588,14 +651,16 @@ class SemanticResolver:
         """
         if not papers:
             return []
-        texts = [f"{p.title}\n{p.abstract}" if p.abstract else (p.title or "")
-                 for p in papers]
+        texts = [self.embedder.join_paper_text(p.title, p.abstract) for p in papers]
         vectors = self.embedder.encode([description, *texts])
         query_vec, paper_vecs = vectors[0], vectors[1:]
 
         for paper, vec in zip(papers, paper_vecs):
             score = cosine(query_vec, vec)
-            paper.title_only = not paper.abstract
+            # Same emptiness test join_paper_text applies, so the flag and the
+            # penalty always describe the text that was actually embedded — a
+            # whitespace-only abstract is title-only in both.
+            paper.title_only = not (paper.abstract or "").strip()
             paper.similarity = score * (TITLE_ONLY_PENALTY if paper.title_only else 1.0)
 
         papers.sort(key=lambda p: p.similarity, reverse=True)
@@ -704,7 +769,10 @@ class SemanticResolver:
 
         resolution.truncated_sources = sorted(truncated)
 
-        papers = self._rank(description, self._dedup(candidates))
+        pool = self._dedup(candidates)
+        if self.pool_dump:
+            self._dump_pool(description, queries, pool)
+        papers = self._rank(description, pool)
         resolution.pool_size = len(papers)
         resolution.scored = [round(p.similarity, 4) for p in papers]
 

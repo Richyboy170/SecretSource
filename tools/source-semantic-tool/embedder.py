@@ -12,10 +12,23 @@ from __future__ import annotations
 import math
 import os
 
-# Fast and small (~90 MB). See the README's Tuning table for the alternatives —
-# `allenai-specter` is trained on scientific papers, `all-mpnet-base-v2` scores
-# better and runs slower. Changing the model invalidates MIN_SIMILARITY.
-DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Trained on scientific title+abstract pairs, 512-token window, ~250 MB.
+#
+# What this ranks is a title plus an abstract, and the previous default —
+# `all-MiniLM-L6-v2`, 256 tokens — could not read one. Measured over a frozen
+# pool of 363 candidates (bench_ranking.py, 2026-08-08): 27-53% of papers per
+# query overran that window, the longest at 977 word-pieces, so the score came
+# from the title and the opening sentences rather than from the abstract. Under
+# specter that falls to 0-6 papers per query, and the top-5 stops being led by
+# abstract-less hits.
+#
+# Fully qualified so `_is_cached` finds the snapshot — the bare `allenai-specter`
+# alias resolves at load time but not on disk, which would leave every run making
+# a Hub round-trip and break offline use.
+#
+# Changing this invalidates MIN_SIMILARITY: cosines are not comparable across
+# models. Re-run the calibration in the README before shipping a swap.
+DEFAULT_MODEL = "sentence-transformers/allenai-specter"
 
 
 def _is_cached(model_name: str) -> bool:
@@ -75,6 +88,48 @@ class Embedder:
             texts, normalize_embeddings=True, show_progress_bar=False
         )
         return [[float(x) for x in v] for v in vectors]
+
+    @property
+    def max_seq_length(self) -> int:
+        """Input window in word-pieces. Anything past it is silently truncated.
+
+        Exposed because the thing being embedded is a title plus an abstract:
+        `all-MiniLM-L6-v2` stops at 256, which clips a normal 200-250 word
+        abstract, so the score ends up driven by the title and the opening
+        sentences. Callers that want to know whether the abstract actually
+        reached the model have to be able to ask.
+        """
+        return int(self._load().max_seq_length)
+
+    def join_paper_text(self, title: str | None, abstract: str | None) -> str:
+        """Join a title and abstract the way THIS model was trained to read them.
+
+        SPECTER was trained on `title [SEP] abstract` and is documented to be fed
+        that way; the all-* MiniLM/MPNet models have no such convention and take
+        a plain newline. Getting this wrong does not raise — it just quietly
+        scores worse, which is indistinguishable from the model being a bad fit.
+
+        A title-less paper is dropped in `_dedup` before it reaches here, and an
+        abstract-less one is scored on its title alone (and penalized by the
+        caller), so neither side is padded with a separator it did not earn.
+        """
+        title = (title or "").strip()
+        abstract = (abstract or "").strip()
+        if not abstract:
+            return title
+        if not title:
+            return abstract
+        return f"{title}{self.pair_separator}{abstract}"
+
+    @property
+    def pair_separator(self) -> str:
+        """Separator for `join_paper_text`. `[SEP]` for SPECTER-family models."""
+        if "specter" in self.model_name.lower():
+            # The literal token, not a hardcoded string: SPECTER's tokenizer maps
+            # it to a single special id, whereas any other spelling would be
+            # tokenized as ordinary text and land the model off-distribution.
+            return self._load().tokenizer.sep_token
+        return "\n"
 
 
 def cosine(a: list[float], b: list[float]) -> float:

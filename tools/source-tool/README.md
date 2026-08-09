@@ -4,14 +4,16 @@ Resolves a cited paper — by title, DOI, or both — to a verified open-access 
 
 Built as the **evidence-acquisition node** for a citation-verification pipeline: given a citation, find the actual paper. A wrong PDF returned confidently is worse than no PDF, so every hit is title-verified, host-checked, and byte-validated before it lands on disk.
 
-**Working as of 2026-08-06.** Both of these end-to-end paths are verified against the live APIs:
+**Validated 2026-08-08** — see [`VALIDATION.md`](VALIDATION.md) for every case that was checked, what it returned, and what is still not covered. Both of these end-to-end paths are verified against the live APIs:
 
 ```powershell
 py fetch_papers.py "Attention Is All You Need"     # OK — 2.2 MB from arxiv.org
 py fetch_papers.py --doi 10.1038/sdata.2016.18     # OK — from nature.com
 ```
 
-Before trusting output, read [Known limitations](#known-limitations-and-open-problems) — in particular, **the recorded DOI can be wrong even when the PDF is right**.
+Run `py validate_offline.py` for the 52 offline checks; it needs no network and takes under a second.
+
+Before trusting output, read [Known limitations](#known-limitations-and-open-problems). The manifest `doi` now names the copy that was actually downloaded, so it is safe to pass downstream — but **a preprint's DOI is not the published DOI**, and the resolver will return a preprint for a paywalled citation.
 
 ---
 
@@ -47,6 +49,7 @@ Not optional — Unpaywall rejects requests without it, and Crossref and OpenAle
 | `py fetch_papers.py "..." --workers 8` | More papers in flight (default 4) |
 | `py fetch_papers.py "..." --any-host` | Ignore the allowlist entirely |
 | `py paper_resolver.py` | Resolve-only smoke test, no downloads |
+| `py validate_offline.py` | 52 offline checks — allowlist, matching, ranking, filenames |
 
 ### Batch file format (`--from-file`)
 
@@ -69,6 +72,8 @@ The third form is the most reliable: the **DOI** pins exact identity, the **titl
 | **`sources.txt`** | **The file you edit.** Sites you allow PDFs to come from, one URL per line. |
 | **`paper_resolver.py`** | The resolver library. Queries six scholarly APIs, scores title matches, verifies PDF URLs. Also exposes the agent tool schema. |
 | **`fetch_papers.py`** | CLI runner. Applies the allowlist, downloads, writes the manifest. |
+| `validate_offline.py` | Offline check harness. Run it after touching matching, ranking or naming. |
+| `VALIDATION.md` | What has been validated, in which cases, and what has not. |
 | `output_pdf/` | Created on first run. Downloaded PDFs. |
 | `output_pdf/manifest.jsonl` | Appended every run — one JSON record per paper with status, path, matched title, confidence, source, and per-API errors. |
 
@@ -149,8 +154,9 @@ That is why `alternatives` in the manifest often lists the same `source` twice. 
 
 | Guard | Stage | Catches |
 |---|---|---|
-| `identity_score()` | Resolver | Ranks a hit's proof of identity: matching DOI → 1.0; otherwise title similarity; a DOI that *disagrees* with no title to fall back on → 0.0 |
+| `identity_score()` | Resolver | Ranks a hit's proof of identity: matching DOI → 1.0; a hit from a *title search* against a DOI-pinned query → 0.0; otherwise title similarity |
 | Title similarity ≥ 0.82 | Resolver | An index returning a *different paper* for your query |
+| `pick_best()` | Resolver | Identity outranks fetchability, so a reachable near-match can never displace an exact match whose PDF happens to be paywalled |
 | PMC record identity | Resolver | PMC search is *full-text*, so its hits are scored on the record's own title/DOI, never on the query |
 | `HEAD` / `%PDF-` sniff | Resolver | A `.pdf` URL that actually serves an HTML paywall |
 | Allowlist filter | Runner | Mirrors, aggregators, and pirate sites |
@@ -190,7 +196,7 @@ from paper_resolver import FIND_PAPER_PDF_TOOL, find_paper_pdf
 # find_paper_pdf(title=..., doi=...) -> await on the matching tool_use event
 ```
 
-Returns a dict with `pdf_url`, `doi`, `matched_title`, `confidence`, `source`, `alternatives`, and `errors`. A null `pdf_url` means no open-access copy was found — **not** that the paper doesn't exist, and the agent prompt should say so explicitly, or it will report fabrication where there is only a paywall.
+Returns a dict with `pdf_url`, `doi`, `work_doi`, `matched_title`, `confidence`, `source`, `alternatives`, and `errors`. `doi` is the identity of the copy on offer; `work_doi` is the index's work-level DOI and is not proof of anything. A null `pdf_url` means no open-access copy was found — **not** that the paper doesn't exist, and the agent prompt should say so explicitly, or it will report fabrication where there is only a paywall.
 
 For batch verification, hold one `PaperResolver` open and call `.resolve()` directly instead of `find_paper_pdf()`, which opens a client per call:
 
@@ -206,18 +212,18 @@ async with PaperResolver() as resolver:
 
 Ordered by how much damage they can do downstream.
 
-### 1. The recorded DOI can be wrong even when the PDF is right — *unfixed*
+### 1. A paywalled citation resolves to its preprint, under the preprint's DOI — *by design, but know it*
 
-Candidates inherit the **work-level** DOI from the index, not the identity of the specific location the PDF came from. When an index has merged a predatory mirror into a work record, the right file is filed under the wrong identity:
+The manifest `doi` now names the copy that was downloaded, not the work record it was merged into. For an arXiv copy that means the arXiv DOI:
 
 ```
-output_pdf/attention-is-all-you-need_10-65215-2q58a426.pdf
-                                     ^^^^^^^^^^^^^^^^^^^ the mirror's fake DOI
+"doi":      "10.48550/arXiv.1706.03762",   <- what you actually have
+"work_doi": "10.65215/2q58a426"            <- what the index called the work
 ```
 
-That file genuinely is Vaswani et al. 2017, downloaded from `arxiv.org`. But `10.65215/2q58a426` is a junk DOI a predatory site attached to OpenAlex work `W2626778328`, and it reaches **two** surfaces: the `doi` field of the manifest record, and — via `slugify()` in `fetch_papers.py` — the filename on disk.
+Both are reported, and the filename uses the first. This is correct, but it means **a resolved `doi` will often not equal the DOI you asked for** — a citation to a published paper commonly resolves to the preprint that is actually open access. A downstream verifier must treat preprint-vs-published as a match, not a discrepancy, and should compare `work_doi` when it needs the published identity.
 
-This matters because the pipeline treats `manifest.jsonl` as provenance. **Do not feed the manifest `doi` to a downstream verifier without checking it.** The fix is to prefer a location's own identity (arXiv ID, PMC ID, publisher DOI) over the work-level DOI, which means threading per-location identity through `Candidate`.
+`work_doi` carries no such guarantee: it is whatever the index merged into the record, junk mirrors included. Do not feed it to a verifier as proof of identity.
 
 ### 2. arXiv and Semantic Scholar throttle hard — *mitigated, not solved*
 
@@ -234,9 +240,11 @@ Some open-access PMC records offer only a `.tar.gz` package, no `pdf` link. `10.
 
 The intended escalation — hand a `MISS` to a crawler such as Firecrawl `/search` — is a plan, not code. A `MISS` currently ends the line; the manifest records it and nothing else happens.
 
-### 5. No committed test suite — *not built*
+### 5. Offline checks only — *partly built*
 
-The resolver's behaviour was verified with ad-hoc scripts that were never added to the repo. There is no `pytest` suite, no fixtures, and every check hits the live APIs. `py paper_resolver.py` is the only checked-in smoke test, and it asserts nothing — you have to read its JSON yourself.
+`py validate_offline.py` asserts 52 cases across the allowlist, batch grammar, title matching, identity scoring, ranking and filename construction, and exits non-zero on failure. It is not a `pytest` suite and it has no fixtures.
+
+What it cannot cover is the network half: every API response shape, throttling behaviour and PDF-verification result is exercised only by running the tool for real. The live cases that were checked, and their results, are listed in [`VALIDATION.md`](VALIDATION.md). `py paper_resolver.py` remains a smoke test that asserts nothing — you read its JSON yourself.
 
 ### 6. `--any-host` can prefer a mirror over the canonical copy — *minor*
 
@@ -248,6 +256,8 @@ No caching between runs. `HAVE` short-circuits the *download* once a file is on 
 
 ### Also worth knowing
 
+- **Two recall trade-offs were taken deliberately**, both in favour of returning nothing over returning the wrong paper. A DOI-pinned query now rejects title-search hits outright, so a paper that only arXiv or PMC's full-text index knows about becomes a `MISS` rather than an unverified guess. And the containment bonus is one-directional, so citing a short form of a long title no longer matches the full record. If you are chasing recall rather than provenance, these are the two knobs to reconsider first.
+- **A one-word-different title can still enter the candidate pool.** "Not All Attention Is All You Need" scores 0.86 against "Attention Is All You Need" on raw sequence ratio; it is held under the threshold by an explicit prepend rule, but the general problem — titles that differ by a negation — is not solved by string similarity and would need author or year metadata to close.
 - Paywalled publishers in the starter `sources.txt` (ScienceDirect, Wiley, IEEE, ACM) pass the host check and then fail PDF validation on the login page — see the note under [Tuning](#tuning).
 - `CONTACT_EMAIL` must be a real address. Unpaywall rejects requests without one; Crossref and OpenAlex demote unidentified clients into a throttled anonymous pool, which makes everything above worse.
 
@@ -259,6 +269,12 @@ Kept here because each was a silent-wrong-answer bug, and the reasoning is worth
 
 | Fix | Was | Now |
 |---|---|---|
+| **DOI-pinned queries** | A hit from a *title search* could satisfy a query that supplied a DOI. `Deep learning \| 10.1038/nature14539` downloaded arXiv 1807.07987 — a different paper by different authors — at confidence 1.0, because `identity_score()` only compared DOIs when the *candidate* had one and otherwise fell through to the title. | Candidates carry `doi_keyed`: true only for records fetched *by DOI lookup*. A title-search hit scores 0.0 against a DOI-pinned query. The same case now reports `FAIL` — the paper is paywalled — instead of the wrong PDF. |
+| **Identity vs fetchability** | Ranking on `confidence` let the 0.7 unverified discount overrule identity, so a title-only match with a reachable PDF (1.0) beat an exact DOI match whose PDF was paywalled (0.7). | `pick_best()` ranks identity first and uses verification only to break ties *within* the top identity tier. |
+| **Containment scoring** | `title_similarity()` returned 0.95 whenever either title contained the other, so a candidate that *added* words scored as a match: "Not All Attention Is All You Need" and "Tensor Product Attention Is All You Need" both entered the pool at 0.95 for the query "Attention Is All You Need". | The bonus applies only when the *found* title is the shorter one — the truncation the rule exists for. Prepended words are held under the threshold. |
+| **Borrowed identity in filenames** | `slugify()` fell back to the *requested* DOI when the matched candidate had none, stamping an identity onto content that never matched it: a file containing arXiv 1807.07987 was named `deep-learning_10-1038-nature14539.pdf`. | Only the matched copy's own DOI names the file; with nothing proved, a URL digest disambiguates instead. |
+| **Location identity** | Candidates inherited the **work-level** DOI, so a correct arXiv PDF was filed under a predatory mirror's junk DOI (`10.65215/2q58a426`) in both the manifest and the filename. | `location_doi()` derives the copy's own DOI where the host mints one. The manifest reports `doi` (the copy) and `work_doi` (the record) separately. |
+| **DOI slug truncation** | The filename kept the *last* 24 characters of the DOI slug, cutting the registrant prefix off the front (`..._-1038-s41598-025-25616-x.pdf`). | Keeps the head, so the DOI stays readable and parseable. |
 | **PubMed identity** | `_pubmed()` built its candidate from the **query**, so `title_similarity(query, candidate.title)` compared the query to itself and always scored `1.0`. The title guard was structurally incapable of rejecting a PMC hit — the tool downloaded a Nigerian Medical Journal article labelled "Attention Is All You Need". | Title and DOI come from an `esummary` lookup of the record itself. Hits must prove identity from their own metadata. |
 | **PMC search scope** | An unqualified `db=pmc` term is a *full-text* search: "Attention Is All You Need" matched 738,377 articles, and results came back newest-first. | Titles are pinned to the title field as a quoted phrase (`"…"[title]`) with `sort=relevance`. DOIs are still searched bare, then identity-filtered. |
 | **DOI-mismatch scoring** | A DOI-only query whose candidate carried a *different* DOI scored `0.9` and passed the `0.82` threshold. | `identity_score()` returns `0.0`. A differing DOI with a title present still defers to the title, so preprint-vs-published DOIs are not rejected. |

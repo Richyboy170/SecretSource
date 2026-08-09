@@ -356,6 +356,10 @@ async def main() -> int:
     parser.add_argument("--any-host", action="store_true", help="ignore sources.txt")
     parser.add_argument("--dry-run", action="store_true",
                         help="rank and print scores, download nothing")
+    parser.add_argument("--dump-pool", type=Path, default=None,
+                        help="append each description's deduped candidate pool to this "
+                             "JSONL file, before ranking; feed it to bench_ranking.py "
+                             "to compare models over an identical pool")
     args = parser.parse_args()
 
     descriptions: list[str] = []
@@ -403,6 +407,7 @@ async def main() -> int:
         ollama_model=args.ollama_model,
         ollama_url=args.ollama_url,
         verify_pdfs=not args.dry_run,
+        pool_dump=str(args.dump_pool) if args.dump_pool else None,
     ) as resolver, httpx.AsyncClient(
         timeout=60.0, follow_redirects=True, headers=resolver._client.headers
     ) as client:

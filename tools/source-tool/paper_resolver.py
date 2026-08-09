@@ -26,6 +26,22 @@ TITLE_MATCH_THRESHOLD = 0.82
 
 ATOM = {"a": "http://www.w3.org/2005/Atom"}
 
+# arXiv mints a DataCite DOI per submission, so a PDF served from arxiv.org can be
+# identified from its URL alone without another request.
+ARXIV_PDF_RE = re.compile(
+    r"arxiv\.org/(?:pdf|abs)/(\d{4}\.\d{4,5}|[a-z\-]+(?:\.[A-Z]{2})?/\d{7})", re.I)
+
+
+def location_doi(pdf_url: str | None, work_doi: str | None) -> str | None:
+    """Identity of the copy being downloaded, not of the merged work record.
+
+    Indexes hang one work-level DOI on every location they have merged into a
+    record, so a predatory mirror's DOI can end up naming a file that genuinely
+    came from arxiv.org. Where the host mints its own identifiers, prefer those.
+    """
+    match = ARXIV_PDF_RE.search(pdf_url or "")
+    return f"10.48550/arXiv.{match.group(1)}" if match else work_doi
+
 
 # --------------------------------------------------------------------------- #
 # Models
@@ -35,11 +51,22 @@ ATOM = {"a": "http://www.w3.org/2005/Atom"}
 class Candidate:
     source: str
     title: str | None = None
-    doi: str | None = None
+    doi: str | None = None            # work-level, as the index reported it
+    location_doi: str | None = None   # this copy's own, where the host mints one
     pdf_url: str | None = None
     landing_url: str | None = None
     title_score: float = 0.0
     pdf_verified: bool = False
+    # True when this record was retrieved *by DOI lookup*, so it is the record for
+    # the DOI that was asked for even if it echoes no DOI back. A hit from a title
+    # search is not, and may not stand in for one.
+    doi_keyed: bool = False
+
+    @property
+    def identity(self) -> str | None:
+        """The DOI of the copy on offer: the location's own where one is derivable,
+        otherwise the index's work-level DOI."""
+        return self.location_doi or self.doi
 
     @property
     def confidence(self) -> float:
@@ -50,13 +77,30 @@ class Candidate:
         return {
             "source": self.source,
             "title": self.title,
-            "doi": self.doi,
+            "doi": self.identity,
+            "work_doi": self.doi,
             "pdf_url": self.pdf_url,
             "landing_url": self.landing_url,
             "title_score": round(self.title_score, 3),
             "pdf_verified": self.pdf_verified,
             "confidence": self.confidence,
         }
+
+
+def pick_best(candidates: list[Candidate]) -> Candidate | None:
+    """Highest identity wins; a fetchable PDF only breaks ties inside that tier.
+
+    Ranking on `confidence` alone lets the 0.7 unverified discount overrule
+    identity — a title-only match with a reachable PDF (1.0) beats an exact DOI
+    match whose PDF failed its HEAD check (0.7), and the wrong paper is chosen. A
+    PDF we cannot confirm becomes a download that fails loudly; the wrong paper is
+    a silent wrong answer, which is the one outcome this tool exists to prevent.
+    """
+    if not candidates:
+        return None
+    top = max(c.title_score for c in candidates)
+    tier = [c for c in candidates if c.title_score >= top - 1e-9]
+    return next((c for c in tier if c.pdf_verified), tier[0])
 
 
 @dataclass
@@ -74,7 +118,10 @@ class Resolution:
     def as_dict(self) -> dict:
         return {
             "pdf_url": self.pdf_url,
-            "doi": self.best.doi if self.best else self.query_doi,
+            # The identity of the copy on offer, never the identity that was merely
+            # requested — a resolution must not echo back an assumption as a finding.
+            "doi": self.best.identity if self.best else None,
+            "work_doi": self.best.doi if self.best else None,
             "matched_title": self.best.title if self.best else None,
             "confidence": self.best.confidence if self.best else 0.0,
             "source": self.best.source if self.best else None,
@@ -103,26 +150,47 @@ def title_similarity(requested: str, found: str | None) -> float:
         return 0.0
     if a == b:
         return 1.0
-    # Indexes truncate or drop subtitles, so containment usually means "same paper" —
-    # but only when the shorter string is most of the longer one. Without that guard
-    # "Deep learning" would match "Deep learning for image recognition".
-    if (a in b or b in a) and min(len(a), len(b)) / max(len(a), len(b)) >= 0.6:
+    # Indexes truncate titles and drop subtitles, so a *shorter* found title sitting
+    # inside the requested one usually means "same paper" — but only when it is most
+    # of it, or "Deep learning" would match "Deep learning for image recognition".
+    #
+    # The other direction earns nothing. A candidate that ADDS words is normally a
+    # different work: "Tensor Product Attention Is All You Need" contains "Attention
+    # Is All You Need" whole and is a different paper by different authors.
+    if b in a and len(b) / len(a) >= 0.6:
         return 0.95
-    return SequenceMatcher(None, a, b).ratio()
+    ratio = SequenceMatcher(None, a, b).ratio()
+    # Prepended words change the claim, however much of the string survives:
+    # "Not All Attention Is All You Need" reaches 0.86 on raw ratio alone and argues
+    # the opposite of the paper it would be standing in for. Hold it under the bar.
+    if a in b and not b.startswith(a):
+        return min(ratio, TITLE_MATCH_THRESHOLD - 0.01)
+    return ratio
 
 
 def identity_score(candidate: Candidate, title: str | None, doi: str | None) -> float:
     """How strongly a hit proves it is the paper that was asked for."""
-    if doi and candidate.doi and candidate.doi.strip().lower() == doi.strip().lower():
+    if not doi:
+        return title_similarity(title, candidate.title) if title else 0.0
+
+    if candidate.doi and candidate.doi.strip().lower() == doi.strip().lower():
         return 1.0  # exact identity; nothing left to check
-    if title:
-        # Falls here when the DOIs differ too — a preprint carries its own DOI,
-        # so the title still gets to vouch for the match.
-        return title_similarity(title, candidate.title)
-    if doi and candidate.doi:
-        return 0.0  # different DOI and no title to fall back on: different paper
-    # DOI query against a DOI-keyed endpoint that echoed no DOI of its own.
-    return 0.9
+
+    if not candidate.doi_keyed:
+        # A title-search hit scored against a DOI-pinned query. Its title may match,
+        # but nothing here ties it to the DOI that was asked for — and a generic
+        # title carries no weight at all: arXiv 1807.07987 is titled "Deep Learning"
+        # and is not 10.1038/nature14539.
+        return 0.0
+
+    if not candidate.doi:
+        # We asked a DOI-keyed endpoint for this DOI and it answered without echoing
+        # one back. The record is still the record for that DOI.
+        return 0.9
+
+    # The DOIs disagree on a record we fetched *by* DOI — normally a preprint and its
+    # published version, so the title still gets to vouch for the match.
+    return title_similarity(title, candidate.title) if title else 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -244,8 +312,10 @@ class PaperResolver:
                     source="openalex",
                     title=work_title,
                     doi=work_doi,
+                    location_doi=location_doi(pdf, work_doi),
                     pdf_url=pdf,
                     landing_url=loc.get("landing_page_url"),
+                    doi_keyed=bool(doi),
                 ))
 
             if not seen:
@@ -255,8 +325,10 @@ class PaperResolver:
                         source="openalex",
                         title=work_title,
                         doi=work_doi,
+                        location_doi=location_doi(oa_url, work_doi),
                         pdf_url=oa_url,
                         landing_url=(w.get("best_oa_location") or {}).get("landing_page_url"),
+                        doi_keyed=bool(doi),
                     ))
         return out
 
@@ -284,7 +356,9 @@ class PaperResolver:
                 source="semantic_scholar",
                 title=p.get("title"),
                 doi=external.get("DOI"),
+                location_doi=location_doi(pdf, external.get("DOI")),
                 pdf_url=pdf,
+                doi_keyed=bool(doi),
             ))
         return out
 
@@ -297,8 +371,10 @@ class PaperResolver:
             source="unpaywall",
             title=data.get("title"),
             doi=doi,
+            location_doi=location_doi(loc.get("url_for_pdf"), doi),
             pdf_url=loc.get("url_for_pdf"),
             landing_url=loc.get("url_for_landing_page"),
+            doi_keyed=True,  # this endpoint is DOI-keyed and takes nothing else
         )]
 
     async def _crossref(self, title: str | None, doi: str | None) -> list[Candidate]:
@@ -318,8 +394,10 @@ class PaperResolver:
                 source="crossref",
                 title=(item.get("title") or [None])[0],
                 doi=item.get("DOI"),
+                location_doi=location_doi(pdf, item.get("DOI")),
                 pdf_url=pdf,  # frequently publisher-gated; PDF verification will catch it
                 landing_url=item.get("URL"),
+                doi_keyed=bool(doi),
             ))
         return out
 
@@ -334,12 +412,16 @@ class PaperResolver:
         for entry in ET.fromstring(resp.text).findall("a:entry", ATOM):
             pdf = next((l.get("href") for l in entry.findall("a:link", ATOM)
                         if l.get("title") == "pdf"), None)
+            work_doi = entry.findtext("a:doi", namespaces=ATOM)
             out.append(Candidate(
                 source="arxiv",
                 title=(entry.findtext("a:title", default="", namespaces=ATOM) or "").strip(),
-                doi=entry.findtext("a:doi", namespaces=ATOM),
+                doi=work_doi,
+                location_doi=location_doi(pdf, work_doi),
                 pdf_url=pdf,
                 landing_url=entry.findtext("a:id", namespaces=ATOM),
+                # This source only ever runs a *title* search, so its hits can never
+                # stand in for a DOI-pinned query. doi_keyed stays False.
             ))
         return out
 
@@ -409,9 +491,12 @@ class PaperResolver:
             out.append(Candidate(
                 source="pubmed",
                 title=record_title,
-                doi=record_doi,
+                doi=record_doi,  # the record's own, already identity-checked above
                 pdf_url=href,
                 landing_url=f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{uid}/",
+                # A DOI term here is a *full-text* search, not a record lookup, so
+                # these hits get no DOI-keyed trust — the filter above is what vouches
+                # for them, and it only passes a hit whose own DOI matched.
             ))
         return out
 
@@ -470,9 +555,13 @@ class PaperResolver:
             candidates = [Candidate(**{**c.__dict__, "pdf_verified": ok})
                           for c, ok in zip(candidates, verified)]
 
-        candidates.sort(key=lambda c: c.confidence, reverse=True)
-        best = next((c for c in candidates if c.pdf_verified), None) or \
-            (candidates[0] if candidates else None)
+        # Identity first, fetchability second — see pick_best().
+        candidates.sort(key=lambda c: (c.title_score, c.pdf_verified), reverse=True)
+        best = pick_best(candidates)
+        if best is not None:
+            # as_dict() publishes candidates[1:4] as `alternatives`, so the winner has
+            # to sit at index 0 or it is listed twice and a runner-up is hidden.
+            candidates = [best] + [c for c in candidates if c is not best]
 
         return Resolution(query_title=title, query_doi=doi, best=best,
                           candidates=candidates, errors=errors)

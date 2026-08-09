@@ -16,6 +16,8 @@ py fetch_semantic.py "attention mechanisms for neural machine translation" -k 5
 
 Before trusting the output, read [Known limitations](#known-limitations-and-open-problems) — in particular **#1, which explains what the similarity floor can and cannot do.** It is not the identity guard `source-tool` has.
 
+**Validated 2026-08-08** — 127 offline assertions and 9 live end-to-end cases. [`VALIDATION.md`](VALIDATION.md) records which claims on this page were checked, which were re-measured differently, and which parts have no coverage at all. Start there if you need to know how far to trust a given behaviour.
+
 ---
 
 ## What this tool does not guarantee
@@ -38,7 +40,7 @@ Read the abstract before citing anything this tool returns.
 py -m pip install -r requirements.txt
 ```
 
-Pulls `sentence-transformers` and `torch` (~2 GB). Verified on Python 3.14 / win_amd64 — `torch` 2.13.0 ships a `cp314` wheel. The first ranking run downloads the embedding model (~90 MB) into the HuggingFace cache; every run after that sets `HF_HUB_OFFLINE` for itself, so it neither calls the Hub nor prints the `HF_TOKEN` notice. Delete the cache and the next run downloads it again.
+Pulls `sentence-transformers` and `torch` (~2 GB). Verified on Python 3.14 / win_amd64 — `torch` 2.13.0 ships a `cp314` wheel. The first ranking run downloads the embedding model (`allenai-specter`, ~250 MB) into the HuggingFace cache; every run after that sets `HF_HUB_OFFLINE` for itself, so it neither calls the Hub nor prints the `HF_TOKEN` notice. Delete the cache and the next run downloads it again.
 
 Optional — the local query-expansion model:
 
@@ -79,14 +81,17 @@ $env:S2_API_KEY = "your-key"
 | `py fetch_semantic.py "..." --min-similarity 0.0 --dry-run --rank-only` | See the raw score distribution — how you calibrate |
 | `py fetch_semantic.py "..." --no-expand` | Skip query expansion |
 | `py fetch_semantic.py "..." --rank-only` | Fill the top-k strictly by score, even with papers that have no fetchable PDF |
-| `py fetch_semantic.py "..." --model allenai-specter` | A different embedding model |
+| `py fetch_semantic.py "..." --model sentence-transformers/all-MiniLM-L6-v2` | A different embedding model — pass `--min-similarity` too, the floor is model-specific |
 | `py fetch_semantic.py "..." --per-source 30` | Widen the candidate pool |
 | `py fetch_semantic.py --from-file topics.txt` | Batch, one description per line |
 | `py fetch_semantic.py "..." --sources my_sources.txt --out pdfs` | Different allowlist / output dir |
 | `py fetch_semantic.py "..." --any-host` | Ignore the allowlist entirely |
+| `py fetch_semantic.py "..." --dump-pool pool.jsonl` | Also write the deduped candidate pool, unscored, for `bench_ranking.py` |
+| `py bench_ranking.py pool.jsonl --models a,b` | Re-rank that frozen pool with each model — how you compare models and recalibrate |
 | `py query_expander.py "..."` | Test the expander alone |
 | `py semantic_resolver.py` | Resolve-only smoke test, no downloads |
 | `py test_selection.py` | Offline tests for selection and backoff — no network |
+| `py test_validation.py` | Offline tests for parsing, dedup, download and the allowlist — no network |
 
 ### Batch file format (`--from-file`)
 
@@ -108,7 +113,11 @@ retrieval augmented generation for scientific question answering
 | **`sources.txt`** | **The file you edit.** Sites you allow PDFs to come from, one per line. Inline `#` comments are stripped. |
 | `semantic_resolver.py` | The library. Retrieval fan-out, dedup, ranking, top-k selection. Exposes the agent tool schema. |
 | `test_selection.py` | Offline tests for selection and backoff. No network. |
-| `embedder.py` | `sentence-transformers` wrapper. Lazy — the torch import is paid only when ranking runs. |
+| `test_validation.py` | Offline tests for retrieval parsing, dedup, the download guard chain, the allowlist, the manifest contract and the expander. No network. |
+| **`VALIDATION.md`** | **What has been validated, how, and what has not** — claim-by-claim, with the commands that reproduce each result. |
+| `validation_pool.jsonl` | The frozen 332-paper candidate pool `VALIDATION.md`'s score table was measured on. Committed because retrieval is nondeterministic, so the table can be re-derived with `bench_ranking.py`. |
+| `bench_ranking.py` | Offline model comparison. Re-ranks a `--dump-pool` snapshot with several models. No network after the models are cached. |
+| `embedder.py` | `sentence-transformers` wrapper. Lazy — the torch import is paid only when ranking runs. Owns the title/abstract join, which is model-specific. |
 | `query_expander.py` | Ollama client. Description → query variants, with a fallback that cannot fail. |
 | `fetch_semantic.py` | CLI runner. Allowlist, download, manifest. |
 | `requirements.txt` | `httpx`, `sentence-transformers`. |
@@ -295,18 +304,35 @@ either way. The papers *listed under it* are not: `--dry-run` still selects
 fetchable-first. **Add `--rank-only` when you want the listing to be the
 highest-scoring papers**, which is usually what you want while calibrating.
 
-Measured on 2026-08-07 with the default model:
+Measured on 2026-08-08 with the default model (`allenai-specter`), over a frozen 363-paper pool:
 
-| Query | max | median |
-|---|---|---|
-| `attention mechanisms for neural machine translation` | 0.748 | 0.585 |
-| `deep learning methods for predicting protein structure` | 0.826 | — |
-| a loosely-worded paraphrase of the first query | 0.489 | 0.270 |
-| a deliberately nonsensical query | 0.529 | 0.250 |
+| Query | max | median | min | survive `0.70` | of those, `title_only` |
+|---|---|---|---|---|---|
+| `attention mechanism for neural machine translation` | 0.880 | 0.776 | 0.545 | 71 / 89 | 15 |
+| `graph neural networks for molecular property prediction` | 0.895 | 0.747 | 0.616 | 51 / 62 | 12 |
+| `retrieval augmented generation for open-domain question answering` | 0.907 | 0.808 | 0.667 | 88 / 89 | 13 |
+| a loosely-worded paraphrase of the first query | 0.848 | 0.665 | 0.452 | 23 / 73 | 2 |
+| a deliberately nonsensical query | 0.777 | 0.621 | 0.454 | **6 / 50** | 1 |
 
-Correct answers landed between **0.47 and 0.83**; pool medians sat at **0.24–0.29**. The default `MIN_SIMILARITY = 0.35` sits above that tail and below the weakest correct answer observed.
+The **top-5** correct answers landed between 0.84 and 0.91 and the nonsense query topped out at 0.777; ranks below 5 were not inspected, so the *weakest* correct answer is not established — treat 0.84 as the bottom of what was looked at, not as a measured lower bound.
 
-**Changing `--model` invalidates this number** — re-run the calibration.
+**`MIN_SIMILARITY` and `TITLE_ONLY_PENALTY` multiply — calibrate the product, not the distribution.** A paper with no abstract is scored `raw × 0.85`, so it only survives at `raw ≥ MIN_SIMILARITY / 0.85`. The distribution alone argues for a floor of `0.75`, which puts that bar at **0.882** — above the entire pool ceiling on both low-scoring queries above (0.848 and 0.829). That is not a demotion, it is a categorical exclusion of every abstract-less paper, and it bites hardest on vague queries where recall matters most. `0.70` puts the bar at 0.824 and keeps them reachable on all five queries, at the cost of letting the nonsense query return 6 results instead of 1.
+
+**Changing `--model` invalidates this number** — and not loudly. The previous default (`all-MiniLM-L6-v2`) was calibrated at `0.35`; carried onto specter unchanged, that floor lets **100% of every pool through, on all five queries**. A stale floor does not error, it just stops filtering. Re-run the calibration.
+
+The floor is also stricter in absolute terms than the old one, and this was measured on five queries — three of them the tool's own demo topics. A legitimate query whose pool ceiling sits near 0.80 now yields few survivors, and if none of them are fetchable the run reports `MISS` where the looser regime would have returned something. If that happens, lower `--min-similarity` before concluding the papers do not exist.
+
+### Comparing models
+
+Do **not** calibrate by running `fetch_semantic.py` once per model. Retrieval is the noisy part of this pipeline — OpenAlex and Semantic Scholar `429`d on every query during this measurement — so two runs minutes apart see different pools, and the comparison measures source availability rather than the model. Freeze the pool once, then re-rank it:
+
+```
+py fetch_semantic.py --from-file topics.txt --dry-run --rank-only \
+    --min-similarity 0.0 --no-expand --dump-pool pool.jsonl
+py bench_ranking.py pool.jsonl --models sentence-transformers/all-MiniLM-L6-v2,sentence-transformers/allenai-specter
+```
+
+`bench_ranking.py` prints, per model and query: the score distribution, how many papers **overran the model's input window** (the number that decided this swap), how many were scored on title alone, and the top-k titles. Score distributions are not comparable across models — the titles are the quality signal, and a nonsense control query is what bounds the floor from below.
 
 ---
 
@@ -341,16 +367,18 @@ Ordered by how much damage they can do downstream.
 
 This is the most important thing to understand about the tool. `source-tool` can prove a hit is the paper you asked for. **This tool cannot, and no threshold makes it able to.**
 
-Measured on 2026-08-07 with the default model:
+Measured on 2026-08-07 with the then-default `all-MiniLM-L6-v2`:
 
 - A **correct** answer to a loosely-worded query (Bahdanau et al., the actual attention paper) scored **0.468**.
 - The top hit of a **deliberately nonsensical** query scored **0.529**.
 
 The correct answer scored *lower* than the nonsense hit. Cosine similarity is not comparable across queries, so no absolute floor separates the two cases.
 
+Re-measured on 2026-08-08 with `allenai-specter`, the ordering is no longer inverted but the margin is thin: a loose query's correct answer scored **0.848** against the nonsense query's best hit at **0.777**. Better, and still not a guard — 0.07 is not a safety margin, and it was measured on five queries.
+
 An inter-result coherence metric was also tested as a discriminator and **rejected**: one nonsense query produced a coherence of 0.670, higher than a legitimate paraphrased query's 0.536.
 
-What the floor does do is remove the clearly-irrelevant tail (medians 0.24–0.29 and below), which is worth having. What protects you beyond that is the manifest: read the abstract and the `retrieval_sources` before relying on a result. **Do not feed this tool's output to a downstream verifier as though identity had been checked.**
+What the floor does do is remove the clearly-irrelevant tail — at `0.70` the nonsense query returns 6 results instead of 50 — which is worth having. What protects you beyond that is the manifest: read the abstract and the `retrieval_sources` before relying on a result. **Do not feed this tool's output to a downstream verifier as though identity had been checked.**
 
 ### 2. Retrieval breadth caps everything — *mitigated, not solved*
 
@@ -403,9 +431,11 @@ No caching between runs. `HAVE` short-circuits the *download* once a file is on 
 
 ### 7. Test coverage is partial — *narrowed*
 
-`py test_selection.py` covers top-k selection and `Retry-After` backoff with 24 asserting offline tests — no network, so they are deterministic and safe to run against throttled APIs. That is where a bug is *silent*: bad selection still returns plausible papers, just not the ones you could have had.
+`py test_selection.py` covers top-k selection, `Retry-After` backoff and probe pacing with 27 asserting offline tests. `py test_validation.py` adds 100 more over retrieval parsing, dedup, the download guard chain, the allowlist, the manifest contract and the expander. Neither touches the network, so both are deterministic and safe to run against throttled APIs. That is where a bug is *silent*: bad selection still returns plausible papers, just not the ones you could have had.
 
-Retrieval, parsing, dedup and download remain untested. `py semantic_resolver.py` is a smoke test that asserts nothing — you have to read its JSON.
+**Ranking is still not asserted on** — there is no ground-truth set, so nothing checks that the top result is the *right* paper. It is inspectable offline instead: `--dump-pool` freezes a real candidate pool and `bench_ranking.py` re-scores it, so a change to the model or to the embedded text can be compared against a known pool rather than a fresh, differently-throttled run. `py semantic_resolver.py` is a smoke test that asserts nothing — you have to read its JSON.
+
+Several paths remain untested — notably the **`FAIL` / alternate-host fallback loop** (no download failed during validation, so it never executed), cross-model calibration, and every non-default flag combination. See [`VALIDATION.md`](VALIDATION.md) for the full coverage map, including what is *not* covered.
 
 ### 8. OpenAlex has a daily quota you can exhaust — *handled, not avoidable*
 
@@ -422,9 +452,9 @@ OpenAlex meters by credits (`X-RateLimit-Remaining: 0`) and, once you are out, `
 
 | Setting | Where | Note |
 |---|---|---|
-| `MIN_SIMILARITY` | `semantic_resolver.py` | 0.35, measured — see [Calibrating the floor](#calibrating-the-floor). Model-specific. |
-| `TITLE_ONLY_PENALTY` | `semantic_resolver.py` | 0.85. Multiplier for candidates with no abstract. Lower it to push bare titles further down. |
-| `DEFAULT_MODEL` | `embedder.py` | `all-MiniLM-L6-v2` — fast, ~90 MB. `allenai-specter` is trained on scientific papers; `all-mpnet-base-v2` scores better and runs slower. Any change requires re-calibrating the floor. |
+| `MIN_SIMILARITY` | `semantic_resolver.py` | 0.70, measured — see [Calibrating the floor](#calibrating-the-floor). Model-specific, and a stale value fails silently by filtering nothing. |
+| `TITLE_ONLY_PENALTY` | `semantic_resolver.py` | 0.85. Multiplier for candidates with no abstract. Under specter this is a strong demotion (22–51 ranks), not a nudge. **Multiplies with the floor**: a bare title survives only at `raw ≥ MIN_SIMILARITY / 0.85`. Raise it toward 1.0 if you would rather see bare titles than miss them. |
+| `DEFAULT_MODEL` | `embedder.py` | `allenai-specter` — trained on scientific title+abstract pairs, 512-token window, ~250 MB. `all-MiniLM-L6-v2` is ~3× faster and 90 MB but truncates abstracts at 256 tokens; `multi-qa-mpnet-base-dot-v1` is built for short-query→long-passage and measured *worse* here. Any change requires re-calibrating the floor. |
 | `--per-source` | CLI | 20. The single biggest recall knob. Costs latency and embedding time. |
 | `--no-expand` | CLI | Turn expansion off. **Reach for this first when results look generic** — measured to displace a correct answer on a vaguely-worded query (limitation #4). |
 | `--variants` | CLI | 4 expansion queries. Each one multiplies the number of API calls; on `qwen3:1.7b` they are often near-duplicates, so more is not better. |

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -22,7 +23,7 @@ from pathlib import Path
 
 import httpx
 
-from paper_resolver import PaperResolver, Resolution
+from paper_resolver import PaperResolver, Resolution, pick_best
 
 MIN_PDF_BYTES = 1024  # anything smaller is an error page, not a paper
 
@@ -87,13 +88,24 @@ def parse_titles(path: Path) -> list[tuple[str | None, str | None]]:
 
 
 def slugify(resolution: Resolution) -> str:
-    """Stable filename from the matched title, DOI-suffixed so two papers with
-    similar truncated titles cannot overwrite each other."""
-    basis = (resolution.best.title if resolution.best else None) or resolution.query_title or "paper"
+    """Stable filename from the matched title, suffixed with the matched copy's own
+    identity so two papers with similar truncated titles cannot overwrite each other."""
+    best = resolution.best
+    basis = (best.title if best else None) or resolution.query_title or "paper"
     slug = re.sub(r"[^a-z0-9]+", "-", basis.lower()).strip("-")[:80] or "paper"
-    doi = (resolution.best.doi if resolution.best else None) or resolution.query_doi
-    if doi:
-        slug += "_" + re.sub(r"[^a-z0-9]+", "-", doi.lower()).strip("-")[-24:]
+
+    # Only what the match actually proved may name the file. Falling back to the
+    # *requested* DOI stamped a borrowed identity onto content that never matched
+    # it, and the filename is the surface a human reads.
+    identity = best.identity if best else None
+    if identity:
+        # Keep the head, not the tail: a DOI is distinctive from its registrant
+        # prefix onwards, and slicing from the end cuts the "10." off the front.
+        slug += "_" + re.sub(r"[^a-z0-9]+", "-", identity.lower()).strip("-")[:40]
+    elif best and best.pdf_url:
+        # Nothing proved an identity, so disambiguate on the URL we fetched rather
+        # than asserting a DOI this copy never established.
+        slug += "_" + hashlib.sha1(best.pdf_url.encode("utf-8")).hexdigest()[:8]
     return slug + ".pdf"
 
 
@@ -146,11 +158,16 @@ async def process(entry: tuple[str | None, str | None], resolver: PaperResolver,
                     else "no open-access PDF found"
                 return Outcome(label, "blocked" if seen else "unresolved",
                                detail=detail, resolution=resolution.as_dict())
+            # Pick by the same rule the resolver uses — identity first, fetchability
+            # only as a tie-break — rather than taking allowed[0] and letting a
+            # verified weaker match outrank a stronger one.
+            chosen = pick_best(allowed)
             # Re-rank rather than just reassigning best, or as_dict() reports best
             # twice and hides the top-ranked blocked candidate. Blocked hits stay in
             # the list as provenance, now in their true position.
-            resolution.candidates = allowed + [c for c in resolution.candidates if c not in allowed]
-            resolution.best = allowed[0]
+            resolution.candidates = ([chosen] + [c for c in allowed if c is not chosen]
+                                     + [c for c in resolution.candidates if c not in allowed])
+            resolution.best = chosen
 
         if not resolution.pdf_url:
             detail = "; ".join(f"{k}={v}" for k, v in resolution.errors.items()) or "no open-access PDF found"
