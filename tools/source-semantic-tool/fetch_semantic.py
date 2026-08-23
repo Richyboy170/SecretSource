@@ -28,6 +28,7 @@ from pathlib import Path
 
 import httpx
 
+import runcost  # first local import: its clocks start when it is imported
 from embedder import DEFAULT_MODEL
 from semantic_resolver import (
     DEFAULT_PER_SOURCE,
@@ -55,6 +56,10 @@ class Outcome:
     resolution: dict | None = None  # source-tool-shaped, for shared consumers
     paper: dict | None = None       # the semantic-specific payload
     run: dict | None = None
+    # What the whole run cost — wall/CPU seconds and peak RAM. Top-level rather
+    # than inside `run` so it sits in the same place as source-tool's, which has
+    # no `run` block: one consumer reads `record["usage"]` from either manifest.
+    usage: dict | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -428,9 +433,17 @@ async def main() -> int:
 
     outcomes = [o for _, group in pairs for o in group]
 
+    # One snapshot, written to every record and printed below, so the manifest
+    # and the console cannot disagree about what the run cost. Note it is a
+    # whole-run figure: descriptions are processed concurrently and the ranking
+    # of one blocks the I/O of another, so it does not divide by description.
+    stats = runcost.measure()
+    snapshot = stats.as_dict()
+
     manifest = args.out / "manifest.jsonl"
     with manifest.open("a", encoding="utf-8") as fh:
         for o in outcomes:
+            o.usage = snapshot
             fh.write(json.dumps(o.__dict__, ensure_ascii=False) + "\n")
 
     marks = {"downloaded": "OK", "skipped": "HAVE", "unresolved": "MISS",
@@ -451,8 +464,16 @@ async def main() -> int:
     counts = {s: sum(1 for o in outcomes if o.status == s) for s in marks}
     print("\n" + "  ".join(f"{k}={v}" for k, v in counts.items() if v))
     print(f"manifest: {manifest}")
+    runcost.report(stats)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    try:
+        code = asyncio.run(main())
+    finally:
+        # The paths that never reached the manifest still cost something, and
+        # --dry-run is the one you most want measured: it loads the same model.
+        # report() has already fired on a normal run and does nothing here.
+        runcost.report()
+    raise SystemExit(code)

@@ -20,6 +20,8 @@ README claim stopped being true.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
 import time
 import xml.etree.ElementTree as ET
@@ -29,6 +31,7 @@ from tempfile import TemporaryDirectory
 import httpx
 
 import query_expander
+import runcost
 from embedder import Embedder, cosine
 from fetch_semantic import (
     MIN_PDF_BYTES,
@@ -611,6 +614,75 @@ def manifest_tests() -> list[bool]:
 
 
 # --------------------------------------------------------------------------- #
+# Run cost — README "Manifest schema", the `usage` block on every record
+# --------------------------------------------------------------------------- #
+
+def runcost_tests() -> list[bool]:
+    """README: every record carries what the run cost.
+
+    Two properties matter more than the numbers themselves. Instrumentation must
+    not be able to fail a run — so an unreadable counter degrades rather than
+    raises. And it must be honest about what it could not see: a platform that
+    will not report memory yields None and prints `n/a`, never a plausible zero.
+    """
+    print("\nrun cost accounting")
+    results = []
+
+    stats = runcost.measure()
+    results.append(check("wall time runs from module import, so it covers the "
+                         "whole run rather than the last stopwatch",
+                         stats.wall_seconds > 0, f"got {stats.wall_seconds}"))
+    results.append(check("CPU time is reported and non-negative",
+                         stats.cpu_seconds >= 0, f"got {stats.cpu_seconds}"))
+    results.append(check("cpu_percent is CPU over wall, as a share of ONE core "
+                         "(over 100 is legitimate — torch uses every core)",
+                         stats.cpu_percent ==
+                         round(100 * stats.cpu_seconds / stats.wall_seconds, 1),
+                         f"got {stats.cpu_percent}"))
+    results.append(check("the wall clock never runs backwards between snapshots",
+                         runcost.measure().wall_seconds >= stats.wall_seconds))
+
+    cost_keys = {"wall_seconds", "cpu_seconds", "cpu_percent",
+                  "peak_rss_bytes", "rss_bytes"}
+    as_dict = stats.as_dict()
+    results.append(check("the run-cost block carries all documented keys",
+                         cost_keys <= as_dict.keys(),
+                         f"missing {cost_keys - as_dict.keys()}"))
+    results.append(check("the block is JSON-serializable (it is written to the "
+                         "manifest on every record)", bool(json.dumps(as_dict))))
+
+    results.append(check("peak RAM is a high-water mark, so it is never below "
+                         "what is resident now",
+                         stats.peak_rss_bytes is None or stats.rss_bytes is None
+                         or stats.peak_rss_bytes >= stats.rss_bytes,
+                         f"peak {stats.peak_rss_bytes} < now {stats.rss_bytes}"))
+
+    blind = runcost.Usage(wall_seconds=1.0, cpu_seconds=0.5, cpu_percent=50.0,
+                        peak_rss_bytes=None, rss_bytes=None)
+    results.append(check("a platform that will not report memory prints n/a, "
+                         "not a zero that would read as a measurement",
+                         blind.line().count("n/a") == 2, f"got {blind.line()}"))
+    results.append(check("bytes render at human scale",
+                         (runcost._bytes(52_428_800), runcost._bytes(1_610_612_736),
+                          runcost._bytes(None)) == ("50 MB", "1.50 GB", "n/a"),
+                         f"got {runcost._bytes(52_428_800)}, "
+                         f"{runcost._bytes(1_610_612_736)}"))
+
+    # Runners call report() once with the snapshot they wrote to the manifest and
+    # again from a finally that catches the early exits. Only the first prints.
+    first, second = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(first):
+        runcost.report(stats)
+    with contextlib.redirect_stdout(second):
+        runcost.report()
+    results.append(check("the run-cost line is printed exactly once per run, "
+                         "however many times a finally-block asks for it",
+                         first.getvalue().startswith("run cost:") and second.getvalue() == "",
+                         f"got {first.getvalue()!r} then {second.getvalue()!r}"))
+    return results
+
+
+# --------------------------------------------------------------------------- #
 # Query expander — README: "deliberately unable to break a run"
 # --------------------------------------------------------------------------- #
 
@@ -758,6 +830,7 @@ async def main() -> int:
     results += text_tests()
     results += scoring_tests()
     results += manifest_tests()
+    results += runcost_tests()
     results += await expander_tests()
     results += await rate_limit_tests()
 

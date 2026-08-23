@@ -23,6 +23,7 @@ from pathlib import Path
 
 import httpx
 
+import runcost  # first local import: its clocks start when it is imported
 from paper_resolver import PaperResolver, Resolution, pick_best
 
 MIN_PDF_BYTES = 1024  # anything smaller is an error page, not a paper
@@ -35,6 +36,10 @@ class Outcome:
     path: str | None = None
     detail: str | None = None
     resolution: dict | None = None
+    # What the whole run cost — wall/CPU seconds and peak RAM. Run-level, so it
+    # is the same object on every record of one run; stamped at manifest time
+    # because that is the first moment the run's total is known.
+    usage: dict | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -237,9 +242,15 @@ async def main() -> int:
             *(process(e, resolver, client, args.out, hosts, semaphore) for e in entries)
         )
 
+    # One snapshot, written to every record and printed below, so the manifest
+    # and the console cannot disagree about what the run cost.
+    stats = runcost.measure()
+    snapshot = stats.as_dict()
+
     manifest = args.out / "manifest.jsonl"
     with manifest.open("a", encoding="utf-8") as fh:
         for o in outcomes:
+            o.usage = snapshot
             fh.write(json.dumps(o.__dict__, ensure_ascii=False) + "\n")
 
     marks = {"downloaded": "OK", "skipped": "HAVE", "unresolved": "MISS",
@@ -252,8 +263,16 @@ async def main() -> int:
     counts = {s: sum(1 for o in outcomes if o.status == s) for s in marks}
     print("\n" + "  ".join(f"{k}={v}" for k, v in counts.items() if v))
     print(f"manifest: {manifest}")
+    runcost.report(stats)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    try:
+        code = asyncio.run(main())
+    finally:
+        # The paths that never reached the manifest still cost something: a bad
+        # command line, a missing allowlist, Ctrl-C. report() has already fired
+        # on a normal run and does nothing here.
+        runcost.report()
+    raise SystemExit(code)

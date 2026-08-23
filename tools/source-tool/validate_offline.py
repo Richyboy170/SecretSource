@@ -14,9 +14,12 @@ validation. They must not be relaxed without re-reading VALIDATION.md.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 from pathlib import Path
 
+import runcost
 from fetch_papers import load_sources, is_allowed, parse_titles, slugify, MIN_PDF_BYTES
 from paper_resolver import (FIND_PAPER_PDF_TOOL, TITLE_MATCH_THRESHOLD, Candidate,
                             Resolution, identity_score, location_doi, normalize_title,
@@ -225,6 +228,44 @@ check("resolution reports the copy identity and the work identity separately",
 check("a resolution with no match reports no DOI at all",
       Resolution(query_title="t", query_doi="10.1/x", best=None).as_dict()["doi"], None)
 
+# --------------------------------------------------------------------------- #
+section("10. Run cost accounting — runcost.py")
+
+# Two properties matter more than the numbers. Instrumentation must not be able
+# to fail a run, and it must be honest about what it could not see: a platform
+# that will not report memory yields None and prints `n/a`, never a plausible 0.
+stats = runcost.measure()
+check("wall time runs from module import, covering the whole run",
+      stats.wall_seconds > 0, True)
+check("CPU time is reported and non-negative", stats.cpu_seconds >= 0, True)
+check("cpu_percent is the two stored fields divided, as a share of one core",
+      stats.cpu_percent, round(100 * stats.cpu_seconds / stats.wall_seconds, 1))
+check("peak RAM is a high-water mark, never below what is resident now",
+      stats.peak_rss_bytes is None or stats.rss_bytes is None
+      or stats.peak_rss_bytes >= stats.rss_bytes, True)
+check("the run-cost block carries the keys the manifest documents",
+      sorted(stats.as_dict()),
+      ["cpu_percent", "cpu_seconds", "peak_rss_bytes", "rss_bytes", "wall_seconds"])
+check("the block is JSON-serializable — it is written to every manifest record",
+      bool(json.dumps(stats.as_dict())), True)
+check("a platform that will not report memory prints n/a, not a zero that would "
+      "read as a measurement",
+      runcost.Usage(1.0, 0.5, 50.0, None, None).line().count("n/a"), 2)
+check("bytes render at human scale",
+      (runcost._bytes(52_428_800), runcost._bytes(1_610_612_736), runcost._bytes(None)),
+      ("50 MB", "1.50 GB", "n/a"))
+
+# The runner prints the snapshot it wrote to the manifest, then calls report()
+# again from a finally that catches the early exits. Only the first prints.
+first, second = io.StringIO(), io.StringIO()
+with contextlib.redirect_stdout(first):
+    runcost.report(stats)
+with contextlib.redirect_stdout(second):
+    runcost.report()
+check("the run-cost line prints exactly once, however often it is asked for",
+      (first.getvalue().startswith("run cost:"), second.getvalue()), (True, ""))
+
+# --------------------------------------------------------------------------- #
 print(f"\nthresholds: TITLE_MATCH_THRESHOLD={TITLE_MATCH_THRESHOLD}  MIN_PDF_BYTES={MIN_PDF_BYTES}")
 print(f"\n{'=' * 60}\n{PASSED} passed, {FAILED} failed\n{'=' * 60}")
 raise SystemExit(1 if FAILED else 0)

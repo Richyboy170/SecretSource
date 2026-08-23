@@ -6,10 +6,12 @@ and both record the query that produced it -- so indexing a folder can pick up
 each paper's title and DOI, and searching it can reuse the original description
 instead of making you retype it.
 
-The two manifests differ, and this module reads either. source-tool writes five
-keys (`query`, `status`, `path`, `detail`, `resolution`); source-semantic-tool
-writes those plus `label`, `paper` and `run`. Only `paper` carries a title, so a
-source-tool record falls back to the filename slug.
+The two manifests differ, and this module reads either. source-tool writes six
+keys (`query`, `status`, `path`, `detail`, `resolution`, `usage`);
+source-semantic-tool writes those plus `label`, `paper` and `run`. Only `paper`
+carries a title, so a source-tool record falls back to the filename slug.
+`usage` is what the producing run cost — wall/CPU seconds and peak RAM — and
+nothing here reads it; it is listed so the shared shape stays documented.
 """
 
 from __future__ import annotations

@@ -11,7 +11,7 @@ py fetch_papers.py "Attention Is All You Need"     # OK — 2.2 MB from arxiv.or
 py fetch_papers.py --doi 10.1038/sdata.2016.18     # OK — from nature.com
 ```
 
-Run `py validate_offline.py` for the 52 offline checks; it needs no network and takes under a second.
+Run `py validate_offline.py` for the 61 offline checks; it needs no network and takes under a second.
 
 Before trusting output, read [Known limitations](#known-limitations-and-open-problems). The manifest `doi` now names the copy that was actually downloaded, so it is safe to pass downstream — but **a preprint's DOI is not the published DOI**, and the resolver will return a preprint for a paywalled citation.
 
@@ -49,7 +49,7 @@ Not optional — Unpaywall rejects requests without it, and Crossref and OpenAle
 | `py fetch_papers.py "..." --workers 8` | More papers in flight (default 4) |
 | `py fetch_papers.py "..." --any-host` | Ignore the allowlist entirely |
 | `py paper_resolver.py` | Resolve-only smoke test, no downloads |
-| `py validate_offline.py` | 52 offline checks — allowlist, matching, ranking, filenames |
+| `py validate_offline.py` | 61 offline checks — allowlist, matching, ranking, filenames, run cost |
 
 ### Batch file format (`--from-file`)
 
@@ -73,9 +73,10 @@ The third form is the most reliable: the **DOI** pins exact identity, the **titl
 | **`paper_resolver.py`** | The resolver library. Queries six scholarly APIs, scores title matches, verifies PDF URLs. Also exposes the agent tool schema. |
 | **`fetch_papers.py`** | CLI runner. Applies the allowlist, downloads, writes the manifest. |
 | `validate_offline.py` | Offline check harness. Run it after touching matching, ranking or naming. |
+| `runcost.py` | What a run cost — wall time, CPU time, peak RAM. Dependency-free; a verbatim copy lives in `source-semantic-tool/`. |
 | `VALIDATION.md` | What has been validated, in which cases, and what has not. |
 | `output_pdf/` | Created on first run. Downloaded PDFs. |
-| `output_pdf/manifest.jsonl` | Appended every run — one JSON record per paper with status, path, matched title, confidence, source, and per-API errors. |
+| `output_pdf/manifest.jsonl` | Appended every run — one JSON record per paper with status, path, matched title, confidence, source, per-API errors, and what the run cost. |
 
 ### `sources.txt`
 
@@ -185,6 +186,26 @@ Read `manifest.jsonl` rather than listing the directory — it carries the prove
 
 ---
 
+## Run cost
+
+Every run ends with what it cost, and every manifest record written by that run carries the same figures under `usage`:
+
+```
+run cost: 12s wall  0.33s CPU (3% of one core)  peak RAM 53 MB  (now 53 MB)
+```
+
+| Field | Meaning |
+|---|---|
+| `wall_seconds` | Measured from the program's first line, so imports and argument parsing are inside it |
+| `cpu_seconds` | This process, across all its threads. Twelve seconds of wall for a third of a second of CPU is the normal shape here: the run is waiting on six APIs, not computing |
+| `cpu_percent` | `cpu_seconds` over `wall_seconds`, as a share of **one** core. Above 100% means several cores were busy at once |
+| `peak_rss_bytes` | The OS's own process-lifetime high-water mark, not a sample — a peak between two readings cannot be missed |
+| `rss_bytes` | Resident at the moment the line was printed |
+
+The figures are whole-run, not per-paper: papers resolve concurrently, so there is nothing to divide. What they cannot see is other processes — the scholarly APIs do their work on their own machines, so a cheap-looking run is cheap *here*. On a platform whose memory counters cannot be read the two RAM fields are `null` and print as `n/a`, rather than a zero that would read as a measurement.
+
+---
+
 ## Using it as an agent tool
 
 `paper_resolver.py` exports both halves of the tool surface:
@@ -242,7 +263,7 @@ The intended escalation — hand a `MISS` to a crawler such as Firecrawl `/searc
 
 ### 5. Offline checks only — *partly built*
 
-`py validate_offline.py` asserts 52 cases across the allowlist, batch grammar, title matching, identity scoring, ranking and filename construction, and exits non-zero on failure. It is not a `pytest` suite and it has no fixtures.
+`py validate_offline.py` asserts 61 cases across the allowlist, batch grammar, title matching, identity scoring, ranking, filename construction and run-cost accounting, and exits non-zero on failure. It is not a `pytest` suite and it has no fixtures.
 
 What it cannot cover is the network half: every API response shape, throttling behaviour and PDF-verification result is exercised only by running the tool for real. The live cases that were checked, and their results, are listed in [`VALIDATION.md`](VALIDATION.md). `py paper_resolver.py` remains a smoke test that asserts nothing — you read its JSON yourself.
 

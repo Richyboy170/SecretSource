@@ -16,7 +16,7 @@ py fetch_semantic.py "attention mechanisms for neural machine translation" -k 5
 
 Before trusting the output, read [Known limitations](#known-limitations-and-open-problems) — in particular **#1, which explains what the similarity floor can and cannot do.** It is not the identity guard `source-tool` has.
 
-**Validated 2026-08-08** — 127 offline assertions and 9 live end-to-end cases. [`VALIDATION.md`](VALIDATION.md) records which claims on this page were checked, which were re-measured differently, and which parts have no coverage at all. Start there if you need to know how far to trust a given behaviour.
+**Validated 2026-08-08** — 127 offline assertions and 9 live end-to-end cases (137 offline today; run-cost accounting was added after that validation). [`VALIDATION.md`](VALIDATION.md) records which claims on this page were checked, which were re-measured differently, and which parts have no coverage at all. Start there if you need to know how far to trust a given behaviour.
 
 ---
 
@@ -120,9 +120,10 @@ retrieval augmented generation for scientific question answering
 | `embedder.py` | `sentence-transformers` wrapper. Lazy — the torch import is paid only when ranking runs. Owns the title/abstract join, which is model-specific. |
 | `query_expander.py` | Ollama client. Description → query variants, with a fallback that cannot fail. |
 | `fetch_semantic.py` | CLI runner. Allowlist, download, manifest. |
+| `runcost.py` | What a run cost — wall time, CPU time, peak RAM. Dependency-free; a verbatim copy lives in `source-tool/`. |
 | `requirements.txt` | `httpx`, `sentence-transformers`. |
 | `output_pdf/` | Created on first run. Downloaded PDFs. |
-| `output_pdf/manifest.jsonl` | Appended every run — one JSON record per result. |
+| `output_pdf/manifest.jsonl` | Appended every run — one JSON record per result, each carrying what the run cost. |
 
 **This tool is self-contained.** The allowlist and download helpers in `fetch_semantic.py` are deliberate copies of `source-tool`'s rather than imports, so this folder can be moved on its own. The tradeoff: a fix to either tool's download path has to be applied twice.
 
@@ -283,11 +284,39 @@ A **superset of `source-tool`'s**, so one consumer can read both. Every record c
 - `paper` — `rank`, `similarity_rank`, `similarity`, `confidence`, `title`, `doi`, `abstract`, `title_only`, `pdf_url`, `pdf_urls`, `landing_url`, `pdf_verified`, `retrieval_sources`, `matched_queries`
 - `run` — `query_description`, `expanded_queries`, `expansion_error`, `embedding_model`, `min_similarity`, `selection`, `verified_window`, `pool_size`, `truncated_sources`, `errors`
 
+and one key `source-tool` now writes too, in the same place, so a single consumer reads it from either manifest:
+
+- `usage` — `wall_seconds`, `cpu_seconds`, `cpu_percent`, `peak_rss_bytes`, `rss_bytes`
+
 `rank` is the position in the output; `similarity_rank` is where the paper would have sat under pure score. They differ whenever fetchable-first selection skipped over something unfetchable, and `run.selection` (`pdf_preferring` or `rank_only`) says which rule produced the set. `verified_window` is how far down the ranking PDFs were probed.
 
 `query` is always the input description, never a result title — matching `source-tool`, where the field is always the input. The rank-and-title string the console prints lives in `label`.
 
 `similarity` is the raw cosine. `confidence` is that score discounted to 0.7× when the PDF URL was not confirmed fetchable — the same shape and meaning as `source-tool`'s `confidence`, so the two are comparable as *numbers*. They are not comparable as *evidence*: `source-tool`'s is grounded in a DOI or title match, this one in a cosine against a description. See limitation #1.
+
+---
+
+## Run cost
+
+Every run ends with what it cost, and every manifest record written by that run carries the same figures under `usage`. `--dry-run` reports it too — it loads the same model, so it costs nearly the same.
+
+```
+run cost: 53s wall  149s CPU (283% of one core)  peak RAM 1.33 GB  (now 797 MB)
+```
+
+That is one description, `--no-expand`, a 77-paper pool, on the default `allenai-specter`. Reading it:
+
+| Field | Meaning |
+|---|---|
+| `wall_seconds` | Measured from the program's first line, so the model load is inside it |
+| `cpu_seconds` | This process, across all its threads — including the native ones torch spawns inside `encode()`, which is why it can exceed the wall clock |
+| `cpu_percent` | `cpu_seconds` over `wall_seconds`, as a share of **one** core. 283% is torch encoding on every core it can find; the retrieval and download phases sit near 0% because they are waiting on APIs |
+| `peak_rss_bytes` | The OS's own process-lifetime high-water mark. Almost all of it is the embedding model — `now` is lower because the encoded batch is freed before the run ends |
+| `rss_bytes` | Resident at the moment the line was printed |
+
+**This is the number to watch when changing models.** `bench_ranking.py` prints the same line and writes it into its `--json` report, so a model that ranks marginally better for twice the RAM shows up as the trade-off it is.
+
+Two things it does not count. **Ollama is a separate process** — query expansion's CPU and RAM are spent over there and are invisible here, so a run with `--no-expand` and one without are not comparable on these figures alone. And the **first ever run downloads the model** (~250 MB), which lands in wall time but not in RAM. The figures are also whole-run rather than per-description: descriptions are processed concurrently and ranking one blocks another's I/O, so there is nothing meaningful to divide.
 
 ---
 
@@ -333,6 +362,8 @@ py bench_ranking.py pool.jsonl --models sentence-transformers/all-MiniLM-L6-v2,s
 ```
 
 `bench_ranking.py` prints, per model and query: the score distribution, how many papers **overran the model's input window** (the number that decided this swap), how many were scored on title alone, and the top-k titles. Score distributions are not comparable across models — the titles are the quality signal, and a nonsense control query is what bounds the floor from below.
+
+It ends with the same `run cost:` line the runner prints, and `--json` carries it as a `usage` block beside `models`. That figure covers every model in `--models` together, since peak RAM is a process high-water mark — to price one model, run it alone.
 
 ---
 
@@ -431,7 +462,7 @@ No caching between runs. `HAVE` short-circuits the *download* once a file is on 
 
 ### 7. Test coverage is partial — *narrowed*
 
-`py test_selection.py` covers top-k selection, `Retry-After` backoff and probe pacing with 27 asserting offline tests. `py test_validation.py` adds 100 more over retrieval parsing, dedup, the download guard chain, the allowlist, the manifest contract and the expander. Neither touches the network, so both are deterministic and safe to run against throttled APIs. That is where a bug is *silent*: bad selection still returns plausible papers, just not the ones you could have had.
+`py test_selection.py` covers top-k selection, `Retry-After` backoff and probe pacing with 27 asserting offline tests. `py test_validation.py` adds 110 more over retrieval parsing, dedup, the download guard chain, the allowlist, the manifest contract, run-cost accounting and the expander — 100 of them at the 2026-08-08 validation, the rest added with `runcost.py`. Neither touches the network, so both are deterministic and safe to run against throttled APIs. That is where a bug is *silent*: bad selection still returns plausible papers, just not the ones you could have had.
 
 **Ranking is still not asserted on** — there is no ground-truth set, so nothing checks that the top result is the *right* paper. It is inspectable offline instead: `--dump-pool` freezes a real candidate pool and `bench_ranking.py` re-scores it, so a change to the model or to the embedded text can be compared against a known pool rather than a fresh, differently-throttled run. `py semantic_resolver.py` is a smoke test that asserts nothing — you have to read its JSON.
 

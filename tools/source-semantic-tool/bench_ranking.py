@@ -38,6 +38,7 @@ import logging
 import sys
 from pathlib import Path
 
+import runcost  # first local import: its clocks start when it is imported
 from embedder import DEFAULT_MODEL, Embedder
 from semantic_resolver import Paper, SemanticResolver
 
@@ -200,12 +201,24 @@ def main() -> int:
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     report = bench(records, models, args.top)
 
+    # Cost belongs in the comparison: a model that ranks marginally better for
+    # twice the RAM is a real trade-off, and this is the run that surfaces it.
+    # The figure covers every model in `--models` together — peak RAM is a
+    # process high-water mark, so it does not attribute to one of them.
+    stats = runcost.measure()
+    report["usage"] = stats.as_dict()
+
     if args.json:
         args.json.write_text(json.dumps(report, indent=2, ensure_ascii=False),
                              encoding="utf-8")
         print(f"\nwrote {args.json}")
+    runcost.report(stats)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        code = main()
+    finally:
+        runcost.report()
+    raise SystemExit(code)
